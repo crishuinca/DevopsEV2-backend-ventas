@@ -1,0 +1,39 @@
+services:
+  backend-ventas:
+    build: .
+    image: innovatech-backend-ventas:local
+    ports:
+      - "8081:8080"
+    environment:
+      DB_HOST: db-ventas
+      DB_ENDPOINT: db-ventas
+      DB_PORT: 3306
+      DB_NAME: ventas_db
+      DB_USERNAME: root
+      DB_PASSWORD: root
+    depends_on:
+      db-ventas:
+        condition: service_healthy
+    networks:
+      - ventas-net
+
+  db-ventas:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: ventas_db
+    volumes:
+      - ventas-data-local:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ventas-net
+
+volumes:
+  ventas-data-local:
+
+networks:
+  ventas-net:
