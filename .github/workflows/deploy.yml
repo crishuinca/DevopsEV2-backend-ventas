@@ -6,7 +6,7 @@ on:
       - deploy
 
 env:
-  IMAGE_NAME: innovatech-backend-ventas
+  ECR_REPOSITORY: innovatech-backend-ventas
   CONTAINER_NAME: innovatech-backend-ventas
 
 jobs:
@@ -16,11 +16,17 @@ jobs:
       - name: Checkout del código
         uses: actions/checkout@v3
 
-      - name: Login en Docker Hub
-        uses: docker/login-action@v2
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login en Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build y push de imagen
         uses: docker/build-push-action@v4
@@ -28,33 +34,68 @@ jobs:
           context: ./Springboot-API-REST
           file: ./Springboot-API-REST/Dockerfile
           push: true
-          tags: ${{ secrets.DOCKER_USER }}/${{ env.IMAGE_NAME }}:latest
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
 
   deploy-to-ec2:
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      - name: Desplegar en EC2
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Obtener token de ECR
+        id: ecr-password
+        run: echo "password=$(aws ecr get-login-password --region ${{ secrets.AWS_REGION }})" >> $GITHUB_OUTPUT
+
+      - name: Desplegar en EC2 backend
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_PASSWORD: ${{ steps.ecr-password.outputs.password }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          DB_PRIVATE_IP: ${{ secrets.DB_PRIVATE_IP }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: 22
+          envs: ECR_REGISTRY,ECR_PASSWORD,ECR_REPOSITORY,CONTAINER_NAME,DB_PRIVATE_IP
           script: |
-            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USER }}" --password-stdin
-            docker pull ${{ secrets.DOCKER_USER }}/${{ env.IMAGE_NAME }}:latest
-            docker stop ${{ env.CONTAINER_NAME }} || true
-            docker rm ${{ env.CONTAINER_NAME }} || true
+            if ! swapon --show | grep -q /swapfile; then
+              sudo fallocate -l 1G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=1024
+              sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+            fi
+            docker stop mysql-despachos mysql-ventas 2>/dev/null || true
+            docker rm mysql-despachos mysql-ventas 2>/dev/null || true
+            echo "$ECR_PASSWORD" | docker login --username AWS --password-stdin $ECR_REGISTRY
+            HOST_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            DB_HOST="${DB_PRIVATE_IP:-$HOST_IP}"
+            docker inspect mysql-innovatech >/dev/null 2>&1 || docker run -d --name mysql-innovatech --restart always \
+              -m 384m -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=ventas_db -p 3306:3306 mysql:8.0
+            docker start mysql-innovatech 2>/dev/null || true
+            echo "Esperando MySQL..."
+            for i in $(seq 1 60); do
+              docker exec mysql-innovatech mysqladmin ping -h 127.0.0.1 -uroot -proot --silent 2>/dev/null && break
+              sleep 3
+            done
+            docker exec mysql-innovatech mysql -uroot -proot -e "CREATE DATABASE IF NOT EXISTS despachos_db;" 2>/dev/null || true
+            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
+            docker stop $CONTAINER_NAME || true
+            docker rm $CONTAINER_NAME || true
             docker run -d \
-              --name ${{ env.CONTAINER_NAME }} \
-              --network innovatech-network \
+              --name $CONTAINER_NAME \
               -p 8081:8080 \
-              -e DB_HOST=db-ventas \
-              -e DB_ENDPOINT=db-ventas \
+              -e DB_HOST=$DB_HOST \
+              -e DB_ENDPOINT=$DB_HOST \
               -e DB_PORT=3306 \
               -e DB_NAME=ventas_db \
               -e DB_USERNAME=root \
               -e DB_PASSWORD=root \
               --restart always \
-              ${{ secrets.DOCKER_USER }}/${{ env.IMAGE_NAME }}:latest
+              $ECR_REGISTRY/$ECR_REPOSITORY:latest
