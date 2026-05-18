@@ -68,14 +68,27 @@ jobs:
           envs: ECR_REGISTRY,ECR_PASSWORD,ECR_REPOSITORY,CONTAINER_NAME,DB_PRIVATE_IP
           script: |
             echo "$ECR_PASSWORD" | docker login --username AWS --password-stdin $ECR_REGISTRY
+            HOST_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            DB_HOST="${DB_PRIVATE_IP:-$HOST_IP}"
+            docker inspect mysql-ventas >/dev/null 2>&1 || docker run -d --name mysql-ventas --restart always \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=ventas_db -p 3306:3306 mysql:8.0
+            docker start mysql-ventas 2>/dev/null || true
+            docker inspect mysql-despachos >/dev/null 2>&1 || docker run -d --name mysql-despachos --restart always \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=despachos_db -p 3307:3306 mysql:8.0
+            docker start mysql-despachos 2>/dev/null || true
+            echo "Esperando MySQL en el host..."
+            for i in $(seq 1 40); do
+              (echo >/dev/tcp/127.0.0.1/3306) >/dev/null 2>&1 && (echo >/dev/tcp/127.0.0.1/3307) >/dev/null 2>&1 && break
+              sleep 3
+            done
             docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
             docker stop $CONTAINER_NAME || true
             docker rm $CONTAINER_NAME || true
             docker run -d \
               --name $CONTAINER_NAME \
               -p 8081:8080 \
-              -e DB_HOST=$DB_PRIVATE_IP \
-              -e DB_ENDPOINT=$DB_PRIVATE_IP \
+              -e DB_HOST=$DB_HOST \
+              -e DB_ENDPOINT=$DB_HOST \
               -e DB_PORT=3306 \
               -e DB_NAME=ventas_db \
               -e DB_USERNAME=root \
