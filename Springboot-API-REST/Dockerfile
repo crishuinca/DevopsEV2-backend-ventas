@@ -14,7 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd 
     && groupadd -r spring && useradd -r -g spring spring
 COPY --from=builder /build/target/*.jar app.jar
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh \
+RUN sed -i 's/\r$//' /entrypoint.sh \
+    && chmod +x /entrypoint.sh \
     && chown -R spring:spring /app /entrypoint.sh
 USER spring:spring
 EXPOSE 8080

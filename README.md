@@ -1,7 +1,7 @@
 # InnovaTech — Backend Ventas (Spring Boot)
 
 **Descripción**  
-API REST de ventas (Spring Boot 3, Java 21). Imagen Docker multi-stage, registro en **ECR** y despliegue automático en la **EC2 backend** al hacer push a la rama `deploy`. Se conecta a MySQL en la misma instancia backend (`mysql-innovatech`, puerto 3306).
+API REST de ventas (Spring Boot 3, Java 21). Imagen Docker multi-stage, registro en **ECR** y despliegue en **EKS** orquestado por el pipeline central de `DevopsEV2-infra`. Se conecta a MySQL en el clúster (`mysql:3306`, base `ventas_db`).
 
 ---
 
@@ -10,9 +10,9 @@ API REST de ventas (Spring Boot 3, Java 21). Imagen Docker multi-stage, registro
 ```
 DevopsEV2-backend-ventas/
 ├── README.md
-├── .github/workflows/deploy.yml
 └── Springboot-API-REST/
     ├── src/main/java/com/citt/
+    ├── src/test/java/             # VentaServiceTest, context tests
     ├── Dockerfile
     ├── docker-compose.yml      # API + MySQL local
     ├── entrypoint.sh
@@ -26,7 +26,7 @@ DevopsEV2-backend-ventas/
 - Docker y Docker Compose v2
 - Java 21 y Maven 3.9+ (desarrollo sin Docker)
 - AWS Academy Learner Lab (despliegue)
-- Secrets GitHub documentados en `infra/README.md`
+- Infra y secrets documentados en `DevopsEV2-infra/README.md`
 
 ---
 
@@ -42,37 +42,53 @@ docker compose up -d --build
 API: **http://localhost:8081**  
 Swagger: **http://localhost:8081/swagger-ui.html**
 
-### Despliegue AWS
+### Despliegue AWS (EV3 — EKS)
 
-1. Aplicar Terraform (`infra`).
-2. Configurar secrets: `EC2_HOST` = IP pública backend, `DB_PRIVATE_IP` = IP **privada** backend.
-3. Push a **`deploy`** → GitHub Actions → ECR → EC2 puerto **8081**.
+1. Aplicar Terraform en `DevopsEV2-infra` (`etapa_1` + `etapa_3`).
+2. Configurar secrets AWS en **DevopsEV2-infra**.
+3. Push a **`deploy`** en **DevopsEV2-infra** → build imagen → push ECR → deployment `backend-ventas` en EKS.
+
+Verificar:
+
+```bash
+kubectl get pods -l app=backend-ventas
+kubectl get hpa backend-ventas-hpa
+```
+
+> El despliegue AWS se dispara únicamente desde **DevopsEV2-infra** (rama `deploy`).
 
 ---
 
 ## 📦 ¿Qué despliega este proyecto?
 
-| Entorno | Contenedor | Puerto |
-|---------|------------|--------|
+| Entorno | Contenedor / Pod | Puerto |
+|---------|------------------|--------|
 | Local | `backend-ventas` | 8081 → 8080 |
 | Local | `db-ventas` (MySQL 8) | 3306 |
-| AWS | `innovatech-backend-ventas` | 8081 (solo accesible desde SG del frontend) |
-| AWS | `mysql-innovatech` (host) | 3306, BD `ventas_db` |
+| AWS (EKS) | `backend-ventas` (3 réplicas, HPA 1–6) | Service ClusterIP **8080** |
+| AWS (EKS) | `mysql` (pod compartido) | `mysql:3306`, BD `ventas_db` |
 
-Variables en deploy: `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`.
+Variables en K8s: `DB_HOST`, `DB_ENDPOINT`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD` (desde Secret `db-credentials`).
+
+**ECR:** `innovatech-backend-ventas`
 
 ---
 
 ## 🧭 Diagrama de arquitectura
 
 ```
-GitHub (rama deploy) → Actions → ECR
-                              ↓ SSH
-                    EC2 Backend (pública para CI, APIs privadas)
-                    ├── mysql-innovatech:3306
-                    └── innovatech-backend-ventas:8081
+DevopsEV2-infra (cd.yml, rama deploy)
+        ├── checkout este repo
+        ├── docker build + push → ECR
+        └── kubectl set image deployment/backend-ventas
+                              │
+                              ▼
+              Pod backend-ventas :8080  ← HPA (CPU 50%)
+                              │
+                              ▼
+              Pod MySQL :3306 / ventas_db
                               ↑
-                    EC2 Frontend (proxy /api/v1/ventas)
+              Pod frontend (proxy /api/v1/ventas)
 ```
 
 ---
@@ -88,17 +104,20 @@ GitHub (rama deploy) → Actions → ECR
 | Tipo | Dónde | Motivo |
 |------|--------|--------|
 | **Named volume** | `docker-compose.yml` → `ventas-data-local:/var/lib/mysql` | En local, los datos de ventas sobreviven a `docker compose down` sin borrar volúmenes. |
-| Sin volumen en deploy API | `deploy.yml` | La app es stateless; la persistencia es responsabilidad del contenedor MySQL en el host. |
+| Sin PVC en EKS | `k8s/mysql.yml` (actual) | MySQL en pod; aceptable para lab; se puede añadir PVC en extensiones. |
 
-**MySQL en EC2:** un solo contenedor `mysql-innovatech` compartido con despachos (segunda BD creada por script en deploy).
+**MySQL en EKS:** un solo pod `mysql` compartido con despachos (`despachos_db` creada por ConfigMap `mysql-init`).
 
-**CI/CD:** build → push `innovatech-backend-ventas:latest` → SSH → swap 1G si hace falta → espera MySQL → `docker run`.
+**CI/CD (EV3):** build → push `innovatech-backend-ventas:${GITHUB_SHA}` → `kubectl set image` + `rollout status`.
+
+**HPA:** `backend-ventas-hpa` escala entre 1 y 6 réplicas según CPU (requiere metrics-server).
 
 ---
 
 ## 🔧 Cómo extender este proyecto
 
-- Añadir `-v mysql-data:/var/lib/mysql` en el `docker run` de MySQL en EC2 para persistencia explícita.
+- PersistentVolumeClaim para MySQL en el manifiesto K8s.
 - Perfiles Spring (`application-prod.properties`) por ambiente.
-- Tests en el pipeline antes del push a ECR.
-- Métricas con Actuator + health en el workflow.
+- Tests en el pipeline (`mvn test`) antes del build Docker.
+- Métricas con Actuator + health probes en el deployment.
+- Flyway/Liquibase para migraciones de esquema.
